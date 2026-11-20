@@ -1,0 +1,269 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+// TargetModelInput is the storage-level contract for a task-local target model.
+// Asset scope is represented by exploration_anchors; payload must not embed asset ids.
+type TargetModelInput struct {
+	Payload     map[string]any
+	TaskID      int64
+	AssetIDs    []int64
+	EvidenceIDs []int64
+	Origin      string
+}
+
+// TargetModelWriteResult describes the newly active model and versions it superseded.
+type TargetModelWriteResult struct {
+	NodeID        int64   `json:"id"`
+	GroupKey      string  `json:"group_key"`
+	Version       int     `json:"version"`
+	SupersededIDs []int64 `json:"superseded_ids,omitempty"`
+}
+
+// AddTargetModel writes a target_model node, anchors, evidence edges and
+// supersedes prior active versions atomically. The exploration row is locked
+// while the per-group version is allocated, avoiding MAX+1 races.
+func (s *ExplorationStore) AddTargetModel(ctx context.Context, in TargetModelInput) (*TargetModelWriteResult, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("target_model 需要任务上下文")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	groupKey := targetModelGroupKey(in.Payload)
+	if groupKey == "" {
+		return nil, fmt.Errorf("target_model.model.group_key 不能为空")
+	}
+	if len(in.AssetIDs) == 0 {
+		return nil, fmt.Errorf("target_model 至少需要一个资产锚点")
+	}
+
+	raw, err := json.Marshal(in.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("target_model payload 无法序列化: %w", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Lock the exploration parent as the per-exploration serialization point.
+	var exists int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM explorations WHERE id=$1 FOR UPDATE`, s.expID).Scan(&exists); err != nil {
+		return nil, err
+	}
+
+	var version int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COALESCE(MAX((payload->'model'->>'version')::int), 0) + 1
+FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=$2
+  AND payload->'model'->>'group_key'=$3`, s.expID, KindTargetModel, groupKey).Scan(&version); err != nil {
+		return nil, err
+	}
+	model, ok := in.Payload["model"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("target_model.model 必须是对象")
+	}
+	model["version"] = version
+	model["group_key"] = groupKey
+	model["status"] = StateTargetModelActive
+	in.Payload["model"] = model
+	raw, err = json.Marshal(in.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("target_model payload 无法序列化: %w", err)
+	}
+
+	var nodeID int64
+	origin := in.Origin
+	if origin == "" {
+		origin = "planner"
+	}
+	if err := tx.QueryRowContext(ctx, `
+INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
+VALUES ($1,$2,$3,8,$4,$5) RETURNING id`, s.expID, KindTargetModel, string(raw), StateTargetModelActive, origin).Scan(&nodeID); err != nil {
+		return nil, err
+	}
+	for _, assetID := range uniquePositiveIDs(in.AssetIDs) {
+		if in.TaskID > 0 {
+			ok, err := targetModelAssetAllowed(ctx, tx, in.TaskID, assetID)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, fmt.Errorf("asset_id %d 不在当前任务授权范围内（未关联该任务，也不在任务/来源任务 scope 中）", assetID)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id,asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, nodeID, assetID); err != nil {
+			return nil, err
+		}
+	}
+	for _, evidenceID := range uniquePositiveIDs(in.EvidenceIDs) {
+		var kind string
+		if err := tx.QueryRowContext(ctx, `SELECT kind FROM exploration_nodes WHERE id=$1 AND exploration_id=$2`, evidenceID, s.expID).Scan(&kind); err != nil {
+			return nil, fmt.Errorf("evidence_id %d 必须是本任务的 fact/finding: %w", evidenceID, err)
+		}
+		if kind != KindFact && kind != KindFinding {
+			return nil, fmt.Errorf("evidence_id %d 是 %q，必须是 fact/finding", evidenceID, kind)
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id)
+VALUES ($1,$2,$3,$4) ON CONFLICT (exploration_id,src_id,rel,dst_id) DO NOTHING`, s.expID, evidenceID, RelDerivedFrom, nodeID); err != nil {
+			return nil, err
+		}
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+SELECT id FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=$2 AND state=$3
+  AND id<>$4 AND payload->'model'->>'group_key'=$5
+ORDER BY id`, s.expID, KindTargetModel, StateTargetModelActive, nodeID, groupKey)
+	if err != nil {
+		return nil, err
+	}
+	var superseded []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		superseded = append(superseded, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	for _, id := range superseded {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE exploration_nodes
+SET state=$1,
+    payload=jsonb_set(payload, '{model,status}', to_jsonb($2::text)),
+    updated_at=now(),
+    content_version=content_version+1
+WHERE id=$3 AND exploration_id=$4`,
+			StateTargetModelSuperseded, StateTargetModelSuperseded, id, s.expID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &TargetModelWriteResult{NodeID: nodeID, GroupKey: groupKey, Version: version, SupersededIDs: superseded}, nil
+}
+
+// ListActiveTargetModels returns the newest active target model of each group,
+// newest group first. Dedup happens in SQL (DISTINCT ON group_key) so a deep
+// history of superseded versions can never push an older group out of the window.
+func (s *ExplorationStore) ListActiveTargetModels(limit int) ([]*Node, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.db.Query(`
+SELECT id, kind, payload, priority, state, origin, owner, blocked_reason, delete_reason, created_at
+FROM (
+  SELECT DISTINCT ON (payload->'model'->>'group_key')
+         id, kind, payload, priority, state,
+         COALESCE(origin,'')         AS origin,
+         COALESCE(owner,'')          AS owner,
+         COALESCE(blocked_reason,'') AS blocked_reason,
+         COALESCE(delete_reason,'')  AS delete_reason,
+         created_at
+  FROM exploration_nodes
+  WHERE exploration_id=$1 AND kind=$2 AND state=$3
+  ORDER BY payload->'model'->>'group_key',
+           (payload->'model'->>'version')::int DESC, id DESC
+) latest
+ORDER BY id DESC LIMIT $4`, s.expID, KindTargetModel, StateTargetModelActive, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
+// ListActiveTargetModelsForAssets returns the newest active model per group among
+// models anchored to any of assetIDs — filtering happens in SQL so a long tail of
+// unrelated groups can never hide the one a worker actually needs.
+func (s *ExplorationStore) ListActiveTargetModelsForAssets(assetIDs []int64, limit int) ([]*Node, error) {
+	ids := uniquePositiveIDs(assetIDs)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.Query(`
+SELECT id, kind, payload, priority, state, origin, owner, blocked_reason, delete_reason, created_at
+FROM (
+  SELECT DISTINCT ON (payload->'model'->>'group_key')
+         id, kind, payload, priority, state,
+         COALESCE(origin,'')         AS origin,
+         COALESCE(owner,'')          AS owner,
+         COALESCE(blocked_reason,'') AS blocked_reason,
+         COALESCE(delete_reason,'')  AS delete_reason,
+         created_at
+  FROM exploration_nodes n
+  WHERE n.exploration_id=$1 AND n.kind=$2 AND n.state=$3
+    AND EXISTS (SELECT 1 FROM exploration_anchors ea
+                WHERE ea.node_id=n.id AND ea.asset_id = ANY($4))
+  ORDER BY payload->'model'->>'group_key',
+           (payload->'model'->>'version')::int DESC, id DESC
+) latest
+ORDER BY id DESC LIMIT $5`, s.expID, KindTargetModel, StateTargetModelActive, ids, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
+func targetModelGroupKey(payload map[string]any) string {
+	model, ok := payload["model"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	key, _ := model["group_key"].(string)
+	return strings.TrimSpace(key)
+}
+
+func uniquePositiveIDs(ids []int64) []int64 {
+	seen := make(map[int64]struct{}, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id > 0 {
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				out = append(out, id)
+			}
+		}
+	}
+	return out
+}
+
+// targetModelAssetAllowed accepts an asset when it belongs to the task either
+// through explicit association (assets.task_ids / task_asset_links) or through
+// the task's (or a direct source task's) declared scope — the same boundary
+// add_intent/list_assets use. Scope-only assets are common: UI/agent scope edits
+// write task_scope without touching per-asset associations.
+func targetModelAssetAllowed(ctx context.Context, tx *sql.Tx, taskID, assetID int64) (bool, error) {
+	var ok bool
+	err := tx.QueryRowContext(ctx, `
+WITH `+scopeTargetCTE+`,
+in_scope AS (SELECT 1 FROM target WHERE id=$2),
+linked AS (
+  SELECT 1 FROM assets a WHERE a.id=$2 AND $1 = ANY(a.task_ids)
+  UNION ALL
+  SELECT 1 FROM task_asset_links l WHERE l.task_id=$1 AND l.asset_id=$2
+)
+SELECT EXISTS(SELECT 1 FROM in_scope) OR EXISTS(SELECT 1 FROM linked)`, taskID, assetID).Scan(&ok)
+	return ok, err
+}

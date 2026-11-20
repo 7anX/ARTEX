@@ -376,6 +376,49 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		hsum = append(hsum, hint)
 	}
 	out["hints"] = hsum
+	// target_models are a permanent, independent slot: they are not part of
+	// recent_facts, cold-digest folding, or coverage accounting.
+	if models, err := t.ts.ListActiveTargetModels(200); err == nil {
+		ids := make([]int64, 0, len(models))
+		for _, n := range models {
+			ids = append(ids, n.ID)
+		}
+		anchors, _ := t.ts.NodeAssets(ids)
+		seen := map[string]bool{}
+		items := make([]map[string]any, 0, 20)
+		more := make([]map[string]any, 0)
+		for _, n := range models {
+			var p map[string]any
+			if json.Unmarshal(n.Payload, &p) != nil {
+				continue
+			}
+			m, _ := p["model"].(map[string]any)
+			group, _ := m["group_key"].(string)
+			if seen[group] {
+				continue
+			}
+			seen[group] = true
+			if len(items) >= 20 {
+				// Beyond the summary window: still give addressable pointers so the
+				// planner can node_detail(id) instead of leaving stale groups invisible.
+				more = append(more, map[string]any{"id": n.ID, "group_key": group, "version": m["version"]})
+				continue
+			}
+			// Compact projection only: full arrays stay behind node_detail(id), so a
+			// large model can never bloat every planner round (and every worker launch).
+			item := map[string]any{"id": n.ID, "group_key": group, "version": m["version"], "status": n.State, "summary": truncateRunes(fmt.Sprint(p["summary"]), 160), "asset_ids": anchors[n.ID]}
+			for _, key := range []string{"roles", "objects", "flows", "trust_boundaries", "assumptions", "invariants", "unknowns"} {
+				if v, ok := m[key].([]any); ok {
+					item[key+"_count"] = len(v)
+				}
+			}
+			items = append(items, item)
+		}
+		out["target_models"] = items
+		if len(more) > 0 {
+			out["target_models_more"] = more
+		}
+	}
 	// lineage from the exploration edges: an intent's parents (what it
 	// derived_from — possibly several facts combined) and its yields (the
 	// facts/findings it produced). factFrom maps a fact → the intent that
@@ -2029,6 +2072,65 @@ func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 		})
 }
 
+// writeTargetModel creates a task-scoped, versioned model of how the target should work.
+// It is intentionally planner-only: worker/mainagent must continue writing observations
+// through record_fact rather than promoting their own model to shared guidance.
+func (t *ToolSet) writeTargetModel() actool.CoreTool {
+	return t.writeExpTool("write_target_model", "写入或修订【目标模型】（任务级业务/安全模型）。它只能作为后续意图的工作依据，不能直接作为漏洞证据；当前任务仍须用 observed fact/traffic 验证。只在 planner 中使用。", obj(map[string]any{
+		"summary":      str("目标模型一行摘要"),
+		"detail":       str("目标如何工作的结构化说明：角色、对象、流程、状态、信任边界、未知项"),
+		"model":        map[string]any{"type": "object", "description": "必须含 group_key；version/status 由系统填写；可含 roles/objects/flows/trust_boundaries/assumptions/invariants/unknowns"},
+		"asset_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "目标模型覆盖的资产 id，至少一个"},
+		"evidence_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "支撑模型的本任务 fact/finding 节点 id"},
+	}),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			if t.worker != "planner" {
+				return actool.Errorf("write_target_model 仅 planner 可用"), nil
+			}
+			if t.taskID <= 0 {
+				return actool.Errorf("write_target_model 需要任务上下文（taskID），当前调用没有可校验的任务范围"), nil
+			}
+			var a struct {
+				Summary     string            `json:"summary"`
+				Detail      string            `json:"detail"`
+				Model       map[string]any    `json:"model"`
+				AssetIDs    []json.RawMessage `json:"asset_ids"`
+				EvidenceIDs []json.RawMessage `json:"evidence_ids"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if strings.TrimSpace(a.Summary) == "" || len(a.Model) == 0 {
+				return actool.Errorf("summary 和 model 必填"), nil
+			}
+			assets := pidList(a.AssetIDs)
+			if len(assets) == 0 {
+				return actool.Errorf("asset_ids 至少需要一个资产"), nil
+			}
+			// Same authorization gate as add_intent: a model must not anchor assets
+			// that failed the task-scope/intercept check.
+			if t.as != nil && t.taskID > 0 {
+				if hits, err := t.as.CheckAssetsIntercept(t.taskID, assets); err != nil {
+					return actool.Errorf(fmt.Sprintf("资产拦截校验失败：%v", err)), nil
+				} else if len(hits) > 0 {
+					return actool.Errorf(fmt.Sprintf("目标模型绑定的资产未通过测试范围校验：%s", hits[0].Describe())), nil
+				}
+			}
+			payload := map[string]any{"summary": strings.TrimSpace(a.Summary), "model": a.Model}
+			if strings.TrimSpace(a.Detail) != "" {
+				payload["detail"] = a.Detail
+			}
+			if raw, err := json.Marshal(payload); err != nil || len(raw) > 16*1024 {
+				return actool.Errorf("target_model payload 必须可序列化且不超过 16KB"), nil
+			}
+			result, err := t.ts.AddTargetModel(ctx, db.TargetModelInput{Payload: payload, TaskID: t.taskID, AssetIDs: assets, EvidenceIDs: pidList(a.EvidenceIDs), Origin: "planner"})
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return jsonResult(result)
+		})
+}
+
 // PlannerTools is the read + intent-generation + goal-judgement tool set.
 func (t *ToolSet) PlannerTools() []actool.CoreTool {
 	return []actool.CoreTool{
@@ -2050,5 +2152,6 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		t.writeTargetModel(),
 	}
 }

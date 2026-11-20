@@ -6,6 +6,7 @@ import {
   ArrowDownIcon,
   ArrowUpIcon,
   ArrowUpToLineIcon,
+  BoxesIcon,
   BugIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -90,10 +91,16 @@ const KIND_META: Record<string, KindMeta> = {
     dot: "bg-teal-500",
     chip: "bg-teal-500/15 text-teal-600 dark:text-teal-400",
   },
+  target_model: {
+    label: "目标模型",
+    icon: BoxesIcon,
+    dot: "bg-indigo-500",
+    chip: "bg-indigo-500/15 text-indigo-600 dark:text-indigo-400",
+  },
 };
 
 // 可筛选的类型。起点(fact/state=origin)不单独列,它跟着「事实」一起过滤。
-const FILTER_KINDS: ExploreKind[] = ["goal", "intent", "fact", "finding", "hint", "digest"];
+const FILTER_KINDS: ExploreKind[] = ["goal", "intent", "fact", "finding", "hint", "digest", "target_model"];
 
 const REL_LABEL: Record<string, string> = {
   spawns: "派生",
@@ -123,6 +130,10 @@ const STATE_META: Record<string, Record<string, { label: string; tone: Tone }>> 
     active: { label: "生效中", tone: "green" },
     superseded: { label: "已替代", tone: "slate" },
   },
+  target_model: {
+    active: { label: "生效中", tone: "green" },
+    superseded: { label: "已替代", tone: "slate" },
+  },
 };
 
 // 任务根是 state=origin 的 fact,播报里读作「起点」。
@@ -139,6 +150,7 @@ const SUMMARY_FIELDS: Record<string, string[]> = {
   finding: ["name", "summary"],
   hint: ["text", "summary"],
   digest: ["body", "summary"],
+  target_model: ["summary"],
 };
 
 function summaryOf(n: TaskNode): string {

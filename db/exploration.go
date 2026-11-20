@@ -464,8 +464,8 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 			return out, err
 		}
 		kind[nid] = k
-		if k == KindGoal || (k == KindFact && st == StateOrigin) {
-			protected[nid] = true // 目标与任务根事实永不随意图删除
+		if k == KindGoal || k == KindTargetModel || (k == KindFact && st == StateOrigin) {
+			protected[nid] = true // 目标、目标模型与任务根事实永不随意图删除
 		}
 	}
 	nrows.Close()
