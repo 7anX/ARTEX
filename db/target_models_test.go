@@ -77,6 +77,38 @@ func TestTargetModelVersioningAndSupersede(t *testing.T) {
 	if err != nil || old == nil || old.State != StateTargetModelSuperseded {
 		t.Fatalf("v1 state = %+v err=%v, want superseded", old, err)
 	}
+	var p1 map[string]any
+	if err := json.Unmarshal(old.Payload, &p1); err != nil {
+		t.Fatal(err)
+	}
+	ids1, _ := p1["evidence_ids"].([]any)
+	if len(ids1) != 1 || int64(ids1[0].(float64)) != factID {
+		t.Fatalf("v1 payload evidence_ids = %#v, want [%d]", p1["evidence_ids"], factID)
+	}
+	m1, _ := p1["model"].(map[string]any)
+	if _, ok := m1["supersedes"]; ok {
+		t.Fatalf("v1 must not carry supersedes: %#v", m1["supersedes"])
+	}
+	// A revision without evidence keeps an explicit empty list, so consumers
+	// never have to distinguish "none" from "field missing".
+	v2node, err := es.GetNode(v2.NodeID)
+	if err != nil || v2node == nil {
+		t.Fatalf("v2 node = %+v err=%v", v2node, err)
+	}
+	var p2 map[string]any
+	if err := json.Unmarshal(v2node.Payload, &p2); err != nil {
+		t.Fatal(err)
+	}
+	if ids2, ok := p2["evidence_ids"].([]any); !ok || len(ids2) != 0 {
+		t.Fatalf("v2 payload evidence_ids = %#v, want []", p2["evidence_ids"])
+	}
+	m2, _ := p2["model"].(map[string]any)
+	if got, ok := m2["supersedes"].(float64); !ok || int64(got) != v1.NodeID {
+		t.Fatalf("v2 supersedes = %#v, want %d", m2["supersedes"], v1.NodeID)
+	}
+	if got, ok := m2["supersedes_version"].(float64); !ok || int(got) != 1 {
+		t.Fatalf("v2 supersedes_version = %#v, want 1", m2["supersedes_version"])
+	}
 	// A different group must not supersede the first group's active version.
 	v3, err := mk("api.example.com", []int64{a3}, nil)
 	if err != nil {
@@ -270,6 +302,25 @@ func TestTargetModelSurvivesIntentCancel(t *testing.T) {
 	if node.State != StateTargetModelActive {
 		t.Fatalf("state = %q, want active", node.State)
 	}
+	// The live derived_from edge cascades with the deleted fact; the payload
+	// copy is what keeps the provenance auditable after the hard delete.
+	var p map[string]any
+	if err := json.Unmarshal(node.Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	ids, _ := p["evidence_ids"].([]any)
+	if len(ids) != 1 || int64(ids[0].(float64)) != factID {
+		t.Fatalf("payload evidence_ids = %#v, want [%d]", p["evidence_ids"], factID)
+	}
+	var edgeCount int
+	if err := d.QueryRow(`SELECT count(*) FROM exploration_edges
+		WHERE exploration_id=$1 AND src_id=$2 AND rel=$3 AND dst_id=$4`,
+		expID, factID, RelDerivedFrom, res.NodeID).Scan(&edgeCount); err != nil {
+		t.Fatal(err)
+	}
+	if edgeCount != 0 {
+		t.Fatalf("derived_from edge survived the hard delete (count=%d)", edgeCount)
+	}
 }
 
 // Scope-only assets (task_scope membership, no per-asset link) must be accepted:
@@ -409,6 +460,86 @@ func TestSchemaUpgradeAddsTargetModelConstraint(t *testing.T) {
 	}
 	if err := es.SetNodeState(id, StateTargetModelSuperseded); err != nil {
 		t.Fatalf("superseded state rejected after upgrade: %v", err)
+	}
+}
+
+// Pre-fix target_model rows have no payload.evidence_ids and no version
+// lineage. Replaying schema.sql must backfill evidence_ids from the live
+// derived_from edges and supersedes from the previous version, so a later hard
+// delete or a "same as previous" detail remains resolvable.
+func TestSchemaBackfillsTargetModelEvidence(t *testing.T) {
+	dsn := testDSN(t)
+	d, err := Open(dsn)
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	expID, err := d.CreateExploration("target-model-backfill", "backfill")
+	if err != nil {
+		d.Close()
+		t.Fatal(err)
+	}
+	es := d.Exploration(expID)
+	factID, err := es.AddNode(KindFact, map[string]any{"summary": "observed"}, 5, "confirmed", "worker", nil)
+	if err != nil {
+		d.Close()
+		t.Fatal(err)
+	}
+	modelID, err := es.AddNode(KindTargetModel, map[string]any{
+		"summary": "legacy model",
+		"model":   map[string]any{"group_key": "legacy.example", "version": 1},
+	}, 8, StateTargetModelActive, "planner", nil)
+	if err != nil {
+		d.Close()
+		t.Fatal(err)
+	}
+	model2ID, err := es.AddNode(KindTargetModel, map[string]any{
+		"summary": "legacy model v2",
+		"model":   map[string]any{"group_key": "legacy.example", "version": 2},
+	}, 8, StateTargetModelActive, "planner", nil)
+	if err != nil {
+		d.Close()
+		t.Fatal(err)
+	}
+	if err := es.Link(factID, RelDerivedFrom, modelID); err != nil {
+		d.Close()
+		t.Fatal(err)
+	}
+	d.Close()
+
+	d2, err := Open(dsn) // replay schema.sql → evidence_ids + supersedes backfill
+	if err != nil {
+		t.Fatalf("schema replay failed: %v", err)
+	}
+	defer d2.Close()
+	defer func() { _, _ = d2.Exec(`DELETE FROM explorations WHERE id=$1`, expID) }()
+
+	node, err := d2.Exploration(expID).GetNode(modelID)
+	if err != nil || node == nil {
+		t.Fatalf("legacy model = %+v err=%v", node, err)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(node.Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	ids, _ := p["evidence_ids"].([]any)
+	if len(ids) != 1 || int64(ids[0].(float64)) != factID {
+		t.Fatalf("backfilled evidence_ids = %#v, want [%d]", p["evidence_ids"], factID)
+	}
+
+	node2, err := d2.Exploration(expID).GetNode(model2ID)
+	if err != nil || node2 == nil {
+		t.Fatalf("legacy model v2 = %+v err=%v", node2, err)
+	}
+	var p2 map[string]any
+	if err := json.Unmarshal(node2.Payload, &p2); err != nil {
+		t.Fatal(err)
+	}
+	m2, _ := p2["model"].(map[string]any)
+	if got, ok := m2["supersedes"].(float64); !ok || int64(got) != modelID {
+		t.Fatalf("backfilled supersedes = %#v, want %d", m2["supersedes"], modelID)
+	}
+	if got, ok := m2["supersedes_version"].(float64); !ok || int(got) != 1 {
+		t.Fatalf("backfilled supersedes_version = %#v, want 1", m2["supersedes_version"])
 	}
 }
 

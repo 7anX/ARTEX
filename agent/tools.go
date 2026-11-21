@@ -351,6 +351,24 @@ func (t *ToolSet) graphOverview() actool.CoreTool {
 // graph_overview tool and the planner's wake-up prompt (which pre-injects it so
 // the model needn't spend a turn calling the tool — every plan round starts with
 // an empty context and always needs this first).
+// targetModelFieldNames are the optional structured fields of a target model.
+// The planner may emit each as a string array or a keyed object; counts must
+// accept both so an object-shaped field never looks empty.
+var targetModelFieldNames = []string{"roles", "objects", "flows", "trust_boundaries", "assumptions", "invariants", "unknowns"}
+
+// targetModelFieldCount counts array elements or object keys; anything else
+// (missing, null, scalar) counts as zero.
+func targetModelFieldCount(v any) int {
+	switch x := v.(type) {
+	case []any:
+		return len(x)
+	case map[string]any:
+		return len(x)
+	default:
+		return 0
+	}
+}
+
 func (t *ToolSet) graphOverviewData() map[string]any {
 	out := map[string]any{}
 	// goals summary folded in so the planner needn't call list_goals each round.
@@ -407,9 +425,18 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			// Compact projection only: full arrays stay behind node_detail(id), so a
 			// large model can never bloat every planner round (and every worker launch).
 			item := map[string]any{"id": n.ID, "group_key": group, "version": m["version"], "status": n.State, "summary": truncateRunes(fmt.Sprint(p["summary"]), 160), "asset_ids": anchors[n.ID]}
-			for _, key := range []string{"roles", "objects", "flows", "trust_boundaries", "assumptions", "invariants", "unknowns"} {
-				if v, ok := m[key].([]any); ok {
-					item[key+"_count"] = len(v)
+			// Version lineage: a compact revision often says "same as previous" in
+			// detail while omitting the structured fields. The pointer makes that
+			// reference resolvable via node_detail(supersedes).
+			if m["supersedes"] != nil {
+				item["supersedes"] = m["supersedes"]
+			}
+			if m["supersedes_version"] != nil {
+				item["supersedes_version"] = m["supersedes_version"]
+			}
+			for _, key := range targetModelFieldNames {
+				if n := targetModelFieldCount(m[key]); n > 0 {
+					item[key+"_count"] = n
 				}
 			}
 			items = append(items, item)
@@ -1033,7 +1060,7 @@ func compactFact(n *db.Node) map[string]any {
 }
 
 func (t *ToolSet) nodeDetail() actool.CoreTool {
-	return t.readExpTool("node_detail", "按 id 取本任务或直接关联任务的【探索图节点】完整内容。继承节点带 source_task_id/inherited=true 且只读。仅限 list_facts/list_findings/graph_overview 返回的探索节点 id；资产请用 list_assets/asset_neighbors。",
+	return t.readExpTool("node_detail", "按 id 取本任务或直接关联任务的【探索图节点】完整内容（包括目标模型全文）。继承节点带 source_task_id/inherited=true 且只读。id 可来自 list_facts/list_findings/graph_overview，或 worker system 里的「目标模型索引」；资产请用 list_assets/asset_neighbors。",
 		obj(map[string]any{"id": idp("探索图节点 id(非资产 id)")}, "id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -2079,7 +2106,7 @@ func (t *ToolSet) writeTargetModel() actool.CoreTool {
 	return t.writeExpTool("write_target_model", "写入或修订【目标模型】（任务级业务/安全模型）。它只能作为后续意图的工作依据，不能直接作为漏洞证据；当前任务仍须用 observed fact/traffic 验证。只在 planner 中使用。", obj(map[string]any{
 		"summary":      str("目标模型一行摘要"),
 		"detail":       str("目标如何工作的结构化说明：角色、对象、流程、状态、信任边界、未知项"),
-		"model":        map[string]any{"type": "object", "description": "必须含 group_key；version/status 由系统填写；可含 roles/objects/flows/trust_boundaries/assumptions/invariants/unknowns"},
+		"model":        map[string]any{"type": "object", "description": "必须含 group_key；version/status/supersedes/supersedes_version 由系统填写；可含 roles/objects/flows/trust_boundaries/assumptions/invariants/unknowns（字符串数组或 {key: 说明} 对象）。修订时可省略未变化的结构化字段，detail 里写“与此前版本一致”；系统会把上一 active 版本记为 supersedes，读者可 node_detail 回查"},
 		"asset_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "目标模型覆盖的资产 id，至少一个"},
 		"evidence_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "支撑模型的本任务 fact/finding 节点 id"},
 	}),

@@ -10,6 +10,9 @@ import (
 
 // TargetModelInput is the storage-level contract for a task-local target model.
 // Asset scope is represented by exploration_anchors; payload must not embed asset ids.
+// EvidenceIDs are used for derived_from edges and are also frozen into
+// payload.evidence_ids, because edges cascade when an evidence node is deleted
+// while the model node itself is protected.
 type TargetModelInput struct {
 	Payload     map[string]any
 	TaskID      int64
@@ -72,13 +75,43 @@ WHERE exploration_id=$1 AND kind=$2
 	if !ok {
 		return nil, fmt.Errorf("target_model.model 必须是对象")
 	}
+	// Record the version this revision supersedes. A compact revision often
+	// says "same as previous" in detail while omitting structured fields, so
+	// the pointer is what makes that reference resolvable via node_detail.
+	var prevID int64
+	var prevVersion int
+	err = tx.QueryRowContext(ctx, `
+SELECT id, COALESCE((payload->'model'->>'version')::int, 0)
+FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=$2 AND state=$3
+  AND payload->'model'->>'group_key'=$4
+ORDER BY (payload->'model'->>'version')::int DESC, id DESC
+LIMIT 1`, s.expID, KindTargetModel, StateTargetModelActive, groupKey).Scan(&prevID, &prevVersion)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	delete(model, "supersedes")
+	delete(model, "supersedes_version")
+	if prevID > 0 {
+		model["supersedes"] = prevID
+		model["supersedes_version"] = prevVersion
+	}
 	model["version"] = version
 	model["group_key"] = groupKey
 	model["status"] = StateTargetModelActive
 	in.Payload["model"] = model
+	// Freeze the evidence ids in the payload as well as the derived_from edges.
+	// Edges are the live graph view and cascade away when an evidence node is
+	// hard-deleted with its intent; the payload keeps the provenance immutable.
+	in.Payload["evidence_ids"] = uniquePositiveIDs(in.EvidenceIDs)
 	raw, err = json.Marshal(in.Payload)
 	if err != nil {
 		return nil, fmt.Errorf("target_model payload 无法序列化: %w", err)
+	}
+	// The tool layer checks before version/status/evidence_ids are added; re-check
+	// the final stored form so the 16KB contract holds end to end.
+	if len(raw) > 16*1024 {
+		return nil, fmt.Errorf("target_model payload 超过 16KB")
 	}
 
 	var nodeID int64

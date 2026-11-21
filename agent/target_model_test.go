@@ -83,7 +83,45 @@ func TestTargetModelContextNoMatch(t *testing.T) {
 	}
 }
 
-// Oversized matched models fall back to compact id+summary pointers.
+// Model index fields are collapsed to one line so a target-derived summary
+// cannot add prompt structure to the worker system message.
+func TestTargetModelContextIsSingleLine(t *testing.T) {
+	items := []map[string]any{{
+		"id": int64(1), "asset_ids": []int64{10},
+		"group": "g\nh", "summary": "line one\nline two",
+	}}
+	got := selectTargetModels(items, []int64{10})
+	if !strings.Contains(got, `"group":"g h"`) {
+		t.Fatalf("group not collapsed: %q", got)
+	}
+	if !strings.Contains(got, `"summary":"line one line two"`) {
+		t.Fatalf("summary not collapsed: %q", got)
+	}
+}
+
+// Object-shaped fields are a valid, information-rich form (role→description,
+// unknown→question); counts must not report them as empty.
+func TestTargetModelFieldCountAcceptsObjects(t *testing.T) {
+	cases := []struct {
+		name string
+		v    any
+		want int
+	}{
+		{"array", []any{"a", "b"}, 2},
+		{"object", map[string]any{"a": "x", "b": "y"}, 2},
+		{"empty array", []any{}, 0},
+		{"scalar", "text", 0},
+		{"nil", nil, 0},
+	}
+	for _, c := range cases {
+		if got := targetModelFieldCount(c.v); got != c.want {
+			t.Fatalf("%s: got %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// Oversized matched models are compressed to an id/group/summary index; the
+// full payload is never injected into the system prompt.
 func TestTargetModelContextSizeCeiling(t *testing.T) {
 	big := strings.Repeat("x", 9000)
 	items := []map[string]any{
@@ -92,10 +130,13 @@ func TestTargetModelContextSizeCeiling(t *testing.T) {
 	}
 	got := selectTargetModels(items, []int64{10})
 	if !strings.Contains(got, "node_detail(id)") {
-		t.Fatalf("expected compact fallback, got %d bytes", len(got))
+		t.Fatalf("expected index pointer, got %d bytes", len(got))
 	}
-	if len(got) > 2000 {
-		t.Fatalf("fallback too large: %d bytes", len(got))
+	if len(got) > 4096 {
+		t.Fatalf("index too large: %d bytes", len(got))
+	}
+	if strings.Contains(got, strings.Repeat("x", 200)) {
+		t.Fatalf("full summary leaked into index: %q", got)
 	}
 }
 
@@ -178,9 +219,18 @@ func TestTargetModelAppearsInOverviewAndWorkerContext(t *testing.T) {
 	store := d.Exploration(task.ExplorationID)
 	planner := NewToolSet(store, "planner")
 	planner.SetTaskID(task.ID)
-	input := json.RawMessage(`{"summary":"e2e model","model":{"group_key":"tmdl-e2e.example","roles":["user"]},"asset_ids":[` + fmt.Sprintf("%d", assetID) + `]}`)
+	input := json.RawMessage(`{"summary":"e2e model","model":{"group_key":"tmdl-e2e.example","roles":{"user":"normal user","admin":"privileged"}},"asset_ids":[` + fmt.Sprintf("%d", assetID) + `]}`)
 	if res, err := planner.writeTargetModel().Call(context.Background(), input, nil); err != nil || res.IsError {
 		t.Fatalf("write failed: err=%v res=%q", err, res.Flatten())
+	}
+	active, err := store.ListActiveTargetModels(10)
+	if err != nil || len(active) != 1 {
+		t.Fatalf("active models after v1 = %d err=%v", len(active), err)
+	}
+	v1ID := active[0].ID
+	input2 := json.RawMessage(`{"summary":"e2e model v2","model":{"group_key":"tmdl-e2e.example","roles":{"user":"normal user","admin":"privileged"}},"asset_ids":[` + fmt.Sprintf("%d", assetID) + `]}`)
+	if res, err := planner.writeTargetModel().Call(context.Background(), input2, nil); err != nil || res.IsError {
+		t.Fatalf("second write failed: err=%v res=%q", err, res.Flatten())
 	}
 
 	overview := planner.graphOverviewData()
@@ -191,12 +241,27 @@ func TestTargetModelAppearsInOverviewAndWorkerContext(t *testing.T) {
 	if items[0]["group_key"] != "tmdl-e2e.example" {
 		t.Fatalf("overview group_key = %v", items[0]["group_key"])
 	}
+	if items[0]["roles_count"] != 2 {
+		t.Fatalf("object roles_count = %v, want 2", items[0]["roles_count"])
+	}
+	if got, ok := items[0]["supersedes"].(float64); !ok || int64(got) != v1ID {
+		t.Fatalf("overview supersedes = %#v, want %d", items[0]["supersedes"], v1ID)
+	}
 
 	worker := NewToolSet(store, "worker-1")
 	worker.SetTaskID(task.ID)
 	ctx := worker.targetModelContextForAssets([]int64{assetID})
 	if !strings.Contains(ctx, "tmdl-e2e.example") {
 		t.Fatalf("worker context missing model: %q", ctx)
+	}
+	if !strings.Contains(ctx, "node_detail(id)") {
+		t.Fatalf("worker context must point at node_detail: %q", ctx)
+	}
+	if !strings.Contains(ctx, fmt.Sprintf(`"supersedes":%d`, v1ID)) {
+		t.Fatalf("worker context missing supersedes pointer: %q", ctx)
+	}
+	if strings.Contains(ctx, `"roles"`) || strings.Contains(ctx, `"user"`) {
+		t.Fatalf("full model payload leaked into system context: %q", ctx)
 	}
 	if ctx := worker.targetModelContextForAssets([]int64{assetID + 999999}); strings.Contains(ctx, "tmdl-e2e.example") {
 		t.Fatalf("worker context leaked model to unrelated asset: %q", ctx)

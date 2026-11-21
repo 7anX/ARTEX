@@ -658,12 +658,13 @@ func (s *Server) reseedPlannerPrompt() {
 
 // reseedWorkerPrompt 把 worker 提示词刷成【当前代码默认】——默认正文 record_fact 段删掉了「否定类结论
 // 写观察+试探性读法」整句、并把 confidence(observed/inferred)与「是否穷尽本意图手段」解耦(这些易误导规划者),
-// 同时把 facts 数组分条收紧为「彼此完全独立、无法归并」的极少数例外；v5 起加入「目标模型是背景、不得当作 finding 证据」规则。
-// bump flag 至 v5 让存量旧库再刷一次。
+// 同时把 facts 数组分条收紧为「彼此完全独立、无法归并」的极少数例外；v5 起加入「目标模型是背景、不得当作
+// finding 证据」规则；v6 起目标模型在 system 里只注入索引，完整内容改由 node_detail(id) 按需读取。
+// bump flag 至 v6 让存量旧库再刷一次。
 // SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理【追加一个新版本】并切过去,旧版本仍保留在历史里可找回。
 // settings flag 守卫 → 成功后只做一次；失败不置位，下次启动重试。全新库无需处理。与 reseedGoalsPrompt 完全同构。
 func (s *Server) reseedWorkerPrompt() {
-	const flag = "worker_prompt_compact_v5"
+	const flag = "worker_prompt_compact_v6"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -685,7 +686,7 @@ func (s *Server) reseedWorkerPrompt() {
 		return // flag 不置位,下次启动重试
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
-	log.Printf("[prompts] worker 提示词已追加新默认版本(目标模型背景规则+查上下文段收敛,一次性)")
+	log.Printf("[prompts] worker 提示词已追加新默认版本(目标模型索引+node_detail 规则+查上下文段收敛,一次性)")
 }
 
 // reporterToolCallMessage 必须无条件要求先读一次 get_finding_traffic 再写报告。

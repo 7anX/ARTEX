@@ -276,6 +276,54 @@ BEGIN
     END IF;
 END $$;
 
+-- target_model evidence provenance backfill. payload.evidence_ids is the
+-- immutable copy; the derived_from edges are only the live graph view and
+-- cascade away when an evidence node is hard-deleted with its intent. Only rows
+-- lacking the key are touched, so replayed schemas never overwrite later writes.
+UPDATE exploration_nodes n
+SET payload = jsonb_set(payload, '{evidence_ids}', ev.ids)
+FROM (
+    SELECT e.dst_id,
+           jsonb_agg(to_jsonb(e.src_id) ORDER BY e.src_id) AS ids
+    FROM exploration_edges e
+    JOIN exploration_nodes m ON m.id = e.dst_id AND m.kind = 'target_model'
+    JOIN exploration_nodes s ON s.id = e.src_id AND s.kind IN ('fact','finding')
+    WHERE e.rel = 'derived_from'
+    GROUP BY e.dst_id
+) ev
+WHERE n.id = ev.dst_id
+  AND n.kind = 'target_model'
+  AND NOT (n.payload ? 'evidence_ids');
+
+UPDATE exploration_nodes
+SET payload = jsonb_set(payload, '{evidence_ids}', '[]'::jsonb)
+WHERE kind = 'target_model'
+  AND NOT (payload ? 'evidence_ids');
+
+-- target_model version lineage backfill. Compact revisions may say "same as
+-- previous" in detail while omitting structured fields; record the immediate
+-- previous version so readers can resolve it with node_detail(supersedes).
+-- Only rows without the pointer are touched, so replayed schemas never
+-- overwrite later writes.
+UPDATE exploration_nodes n
+SET payload = jsonb_set(
+        jsonb_set(n.payload, '{model,supersedes}', to_jsonb(prev.id)),
+        '{model,supersedes_version}', to_jsonb((prev.payload->'model'->>'version')::int))
+FROM exploration_nodes prev
+WHERE n.kind = 'target_model'
+  AND prev.kind = 'target_model'
+  AND prev.exploration_id = n.exploration_id
+  AND prev.payload->'model'->>'group_key' = n.payload->'model'->>'group_key'
+  AND (prev.payload->'model'->>'version')::int = (
+      SELECT MAX((p.payload->'model'->>'version')::int)
+      FROM exploration_nodes p
+      WHERE p.exploration_id = n.exploration_id
+        AND p.kind = 'target_model'
+        AND p.payload->'model'->>'group_key' = n.payload->'model'->>'group_key'
+        AND (p.payload->'model'->>'version')::int < (n.payload->'model'->>'version')::int
+  )
+  AND NOT (n.payload->'model' ? 'supersedes');
+
 CREATE TABLE IF NOT EXISTS exploration_anchors (
     node_id   BIGINT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
     asset_id  BIGINT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
