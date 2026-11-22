@@ -32,6 +32,23 @@ func TestBuiltinPromptsEmbedAndRender(t *testing.T) {
 	}
 }
 
+func TestReporterPromptEmbedded(t *testing.T) {
+	p := ReporterDefaultPrompt
+	for _, want := range []string{"## 1、漏洞详情", "## 2、漏洞证明", "## 3、修复方案", "update_finding_report", "get_finding_traffic", "evidence_version", "<上一步获取的id>", "不要强制附 curl", "整段复制即可执行"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("reporter prompt missing %q", want)
+		}
+	}
+	if strings.Contains(p, "{{") {
+		t.Fatalf("reporter prompt must not contain Go-template placeholders")
+	}
+	for _, bad := range []string{"### 2.1", "### 2.2", "### 2.3"} {
+		if strings.Contains(p, bad) {
+			t.Fatalf("reporter prompt must keep section 2 as one block, found %q", bad)
+		}
+	}
+}
+
 func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	t.Cleanup(func() { PromptOverride = nil })
 

@@ -16,3 +16,9 @@ var plannerDefaultTmpl string
 //
 //go:embed prompts/worker.md
 var workerDefaultTmpl string
+
+// reporterDefaultTmpl is the built-in body seeded into the "reporter" custom
+// agent. It is a plain Markdown document (no Go-template placeholders).
+//
+//go:embed prompts/reporter.md
+var reporterDefaultTmpl string

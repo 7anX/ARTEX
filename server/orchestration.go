@@ -425,7 +425,7 @@ func (s *Server) toolGetTaskNodeDetail() actool.CoreTool {
 // task-agnostic, so this host tool needs no task_id / exploration store.
 func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 	return wrTool("update_finding_report",
-		"为已登记的漏洞写入/更新【详细报告】(Markdown 全文,整段覆盖旧内容)。finding_id 传 report_finding 返回的那个 id(\"finding recorded: <id>\" 里的数字)。报告建议包含:漏洞概述、影响与危害、复现步骤、证据/PoC、修复建议。",
+		"为已登记的漏洞写入/更新【详细报告】(Markdown 全文,整段覆盖旧内容)。finding_id 传 report_finding 返回的那个 id(\"finding recorded: <id>\" 里的数字)。报告固定分为三部分:1、漏洞详情(攻击链路/发现过程/原理与已验证危害);2、漏洞证明(前置条件、可执行复现步骤——字段来源与预期/实际结果写在对应步骤里);3、修复方案。",
 		objSchema(map[string]any{
 			"finding_id":       map[string]any{"type": "integer", "description": "目标漏洞 id(report_finding 返回的 id)"},
 			"report":           strParam("详细报告全文,Markdown 格式"),
@@ -500,6 +500,7 @@ func (s *Server) seedOrchestrationTools() {
 	s.reseedPlannerPrompt()           // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对(一次性)
 	s.reseedWorkerPrompt()            // worker 提示词:加否定结论证据门槛(一次性)
 	s.seedReporterAgent()             // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
+	s.reseedReporterPrompt()          // reporter 提示词:固定三段式报告格式(一次性)
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
 	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
@@ -689,6 +690,37 @@ func (s *Server) reseedWorkerPrompt() {
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
 	log.Printf("[prompts] worker 提示词已追加新默认版本(操作员完整提示词:安全总则/上报纪律/红线+目标模型索引,一次性)")
+}
+
+// reseedReporterPrompt 把「报告撰写」agent 的提示词刷成【当前代码默认】（v2：固定三段式报告格式 +
+// 字段来源 / 可执行复现要求）。reporter 是自定义 agent（builtin=false），seedReporterAgent 只在首次
+// 创建时写提示词，存量库收不到新默认，故用版本管理【追加一个新版本】并切过去，旧版本保留可找回。
+// settings flag 守卫 → 成功后只做一次；失败不置位，下次启动重试。全新库由 SeedPromptIfEmpty 直接
+// seed 最新默认，无需追加。
+func (s *Server) reseedReporterPrompt() {
+	const flag = "reporter_prompt_v2"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	a, err := s.m.pg.GetAgentByKey("reporter")
+	if err != nil || a == nil {
+		return // 用户可能删除了 reporter；flag 留待下次启动重试
+	}
+	tmpl := agent.ReporterDefaultPrompt
+	if tmpl == "" {
+		return
+	}
+	// 全新库已 seed 最新默认 → 当前版本等于代码默认，不必追加重复版本。
+	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
+		_ = s.m.pg.SetSetting(flag, "true")
+		return
+	}
+	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
+		log.Printf("[prompts] reporter 提示词重刷为新默认失败: %v", err)
+		return // flag 不置位，下次启动重试
+	}
+	_ = s.m.pg.SetSetting(flag, "true")
+	log.Printf("[prompts] reporter 提示词已追加新默认版本(固定三段式报告格式,一次性)")
 }
 
 // reporterToolCallMessage 必须无条件要求先读一次 get_finding_traffic 再写报告。
