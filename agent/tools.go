@@ -1060,7 +1060,7 @@ func compactFact(n *db.Node) map[string]any {
 }
 
 func (t *ToolSet) nodeDetail() actool.CoreTool {
-	return t.readExpTool("node_detail", "按 id 取本任务或直接关联任务的【探索图节点】完整内容（包括目标模型全文）。继承节点带 source_task_id/inherited=true 且只读。id 可来自 list_facts/list_findings/graph_overview，或 worker system 里的「目标模型索引」；资产请用 list_assets/asset_neighbors。",
+	return t.readExpTool("node_detail", "按 id 取本任务或直接关联任务的【探索图节点】完整内容（包括目标模型全文）。继承节点带 source_task_id/inherited=true 且只读。id 可来自 list_facts/list_findings/graph_overview，或 worker system 里的「目标模型索引」；资产请用 list_assets。",
 		obj(map[string]any{"id": idp("探索图节点 id(非资产 id)")}, "id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1076,7 +1076,7 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 				return actool.Errorf(err.Error()), nil
 			}
 			if n == nil {
-				return actool.Errorf(fmt.Sprintf("未找到探索节点 %d。若你想查的是资产，请用 list_assets / asset_neighbors（资产与探索节点是不同的 id 空间，资产 id 不能传给 node_detail）。", id)), nil
+				return actool.Errorf(fmt.Sprintf("未找到探索节点 %d。若你想查的是资产，请用 list_assets（资产与探索节点是不同的 id 空间，资产 id 不能传给 node_detail）。", id)), nil
 			}
 			if err := t.ts.PopulateFindingTrafficIDs([]*db.Node{n}); err != nil {
 				return actool.Errorf(err.Error()), nil

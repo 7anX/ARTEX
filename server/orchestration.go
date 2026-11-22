@@ -625,13 +625,14 @@ func (s *Server) reseedMainAgentPrompt() {
 
 // reseedPlannerPrompt 把 planner 提示词刷成【当前代码默认】——默认正文做了精简重构,并把「克制」降级为
 // 仅去重、新增「深度优先于覆盖度」「硬底线:目标未达成且无在跑意图必须产出」、给否定结论复核加上界，
-// v3 起加入「目标模型（target_models）」使用与修订引导。
-// 每次默认有实质变更就 bump 下面的 flag(当前 v3)让存量旧库再刷一次。SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理
+// v3 起加入「目标模型（target_models）」使用与修订引导；v4 起切换为操作员历史使用的完整提示词
+// （安全总则、漏洞价值/重复率判定、测试红线、内网横向边界）。
+// 每次默认有实质变更就 bump 下面的 flag(当前 v4)让存量旧库再刷一次。SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理
 // 【追加一个新版本】并切过去(ResetPromptToDefault),旧版本仍保留在历史里,用户若自定义过可从版本记录
 // 找回。settings flag 守卫 → 成功后只做一次；失败不置位，下次启动重试。全新库无需处理(SeedPromptIfEmpty 已 seed 最新默认)。与
 // reseedGoalsPrompt 完全同构。
 func (s *Server) reseedPlannerPrompt() {
-	const flag = "planner_prompt_compact_realistic_v3"
+	const flag = "planner_prompt_compact_realistic_v4"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -653,18 +654,19 @@ func (s *Server) reseedPlannerPrompt() {
 		return // flag 不置位,下次启动重试
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
-	log.Printf("[prompts] planner 提示词已追加新默认版本(目标模型引导+精简重构+深度优先+否定复核上界,一次性)")
+	log.Printf("[prompts] planner 提示词已追加新默认版本(操作员完整提示词:安全总则/红线/目标模型引导,一次性)")
 }
 
 // reseedWorkerPrompt 把 worker 提示词刷成【当前代码默认】——默认正文 record_fact 段删掉了「否定类结论
 // 写观察+试探性读法」整句、并把 confidence(observed/inferred)与「是否穷尽本意图手段」解耦(这些易误导规划者),
 // 同时把 facts 数组分条收紧为「彼此完全独立、无法归并」的极少数例外；v5 起加入「目标模型是背景、不得当作
-// finding 证据」规则；v6 起目标模型在 system 里只注入索引，完整内容改由 node_detail(id) 按需读取。
-// bump flag 至 v6 让存量旧库再刷一次。
+// finding 证据」规则；v6 起目标模型在 system 里只注入索引，完整内容改由 node_detail(id) 按需读取；
+// v7 起切换为操作员历史使用的完整提示词（安全总则、上报纪律、测试红线、假点判据）。
+// bump flag 至 v7 让存量旧库再刷一次。
 // SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理【追加一个新版本】并切过去,旧版本仍保留在历史里可找回。
 // settings flag 守卫 → 成功后只做一次；失败不置位，下次启动重试。全新库无需处理。与 reseedGoalsPrompt 完全同构。
 func (s *Server) reseedWorkerPrompt() {
-	const flag = "worker_prompt_compact_v6"
+	const flag = "worker_prompt_compact_v7"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -686,7 +688,7 @@ func (s *Server) reseedWorkerPrompt() {
 		return // flag 不置位,下次启动重试
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
-	log.Printf("[prompts] worker 提示词已追加新默认版本(目标模型索引+node_detail 规则+查上下文段收敛,一次性)")
+	log.Printf("[prompts] worker 提示词已追加新默认版本(操作员完整提示词:安全总则/上报纪律/红线+目标模型索引,一次性)")
 }
 
 // reporterToolCallMessage 必须无条件要求先读一次 get_finding_traffic 再写报告。

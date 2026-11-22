@@ -5,6 +5,33 @@ import (
 	"testing"
 )
 
+// The built-in planner/worker bodies are embedded from prompts/*.md; they must
+// load, render {{.Goal}}, and keep the operator safety sections.
+func TestBuiltinPromptsEmbedAndRender(t *testing.T) {
+	prev := PromptOverride
+	PromptOverride = nil
+	t.Cleanup(func() { PromptOverride = prev })
+
+	seeds := BuiltinPromptSeeds()
+	planner := seeds["planner"]
+	if !strings.Contains(planner, "任务即授权") || !strings.Contains(planner, "目标模型（target_models）") {
+		t.Fatalf("planner seed missing operator sections")
+	}
+	rendered := renderSystem("planner", planner, PlannerVars{Goal: "TARGET-X"})
+	if !strings.Contains(rendered, "TARGET-X") || strings.Contains(rendered, "{{") {
+		t.Fatalf("planner seed did not render cleanly")
+	}
+
+	worker := seeds["worker"]
+	if !strings.Contains(worker, "总则") || !strings.Contains(worker, "目标模型是背景") {
+		t.Fatalf("worker seed missing operator sections")
+	}
+	rendered = renderSystem("worker", worker, WorkerVars{})
+	if strings.Contains(rendered, "{{") {
+		t.Fatalf("worker seed did not render cleanly")
+	}
+}
+
 func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	t.Cleanup(func() { PromptOverride = nil })
 
