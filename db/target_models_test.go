@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -610,5 +611,213 @@ func TestTargetModelRejectsCrossExplorationEvidence(t *testing.T) {
 		EvidenceIDs: []int64{foreignFact},
 	}); err == nil {
 		t.Fatal("cross-exploration evidence accepted")
+	}
+}
+
+// A compact revision (structured fields omitted) must leave the active model as
+// a complete snapshot: the server inherits omitted fields from the previous
+// active revision, following its supersedes chain for legacy compact rows, while
+// an explicit [] / {} still clears.
+func TestTargetModelRevisionMaterializesFields(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	expID, err := d.CreateExploration("target-model-materialize", "模型物化")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	es := d.Exploration(expID)
+
+	var assetID int64
+	if err := d.QueryRow(`INSERT INTO assets(type, domain) VALUES ('root_domain','tmdl-materialize.example') RETURNING id`).Scan(&assetID); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM assets WHERE id=$1`, assetID)
+
+	ctx := context.Background()
+	write := func(group, summary string, model map[string]any) *TargetModelWriteResult {
+		model["group_key"] = group
+		res, err := es.AddTargetModel(ctx, TargetModelInput{
+			Payload:  map[string]any{"summary": summary, "model": model},
+			AssetIDs: []int64{assetID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	readModel := func(nodeID int64) map[string]any {
+		n, err := es.GetNode(nodeID)
+		if err != nil || n == nil {
+			t.Fatalf("node %d = %+v err=%v", nodeID, n, err)
+		}
+		var p map[string]any
+		if err := json.Unmarshal(n.Payload, &p); err != nil {
+			t.Fatal(err)
+		}
+		m, _ := p["model"].(map[string]any)
+		return m
+	}
+
+	roles := []any{"user", "admin"}
+	objects := map[string]any{"account": "用户账户"}
+	flows := []any{"login"}
+	trust := []any{"gateway"}
+	assumptions := []any{"session is bound"}
+	invariants := []any{"tenant isolation"}
+	v1 := write("mat.example.com", "v1", map[string]any{
+		"roles": roles, "objects": objects, "flows": flows,
+		"trust_boundaries": trust, "assumptions": assumptions, "invariants": invariants,
+		"unknowns": []any{"audit"},
+	})
+	_ = v1
+	v2 := write("mat.example.com", "v2 compact", map[string]any{"unknowns": []any{"audit", "export"}})
+	m2 := readModel(v2.NodeID)
+	wantInherited := map[string]any{
+		"roles": roles, "objects": objects, "flows": flows,
+		"trust_boundaries": trust, "assumptions": assumptions, "invariants": invariants,
+	}
+	for key, want := range wantInherited {
+		if !reflect.DeepEqual(m2[key], want) {
+			t.Fatalf("%s not inherited: %#v", key, m2[key])
+		}
+	}
+	if !reflect.DeepEqual(m2["unknowns"], []any{"audit", "export"}) {
+		t.Fatalf("new unknowns lost: %#v", m2["unknowns"])
+	}
+
+	v3 := write("mat.example.com", "v3 clears roles", map[string]any{"roles": []any{}, "unknowns": []any{"audit"}})
+	m3 := readModel(v3.NodeID)
+	if !reflect.DeepEqual(m3["roles"], []any{}) {
+		t.Fatalf("explicit empty roles must stay empty: %#v", m3["roles"])
+	}
+	if !reflect.DeepEqual(m3["objects"], objects) {
+		t.Fatalf("omitted objects not inherited: %#v", m3["objects"])
+	}
+
+	// Legacy compact active row: it only has unknowns + supersedes v1. A new
+	// revision that omits roles must resolve through this row to v1.
+	v1b := write("chain.example.com", "chain v1", map[string]any{"roles": []any{"viewer"}, "unknowns": []any{}})
+	compact := map[string]any{"summary": "legacy compact", "model": map[string]any{
+		"group_key": "chain.example.com", "version": 2, "status": "active",
+		"unknowns": []any{"legacy"}, "supersedes": v1b.NodeID, "supersedes_version": 1,
+	}}
+	raw, err := json.Marshal(compact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
+VALUES ($1,'target_model',$2,8,'active','planner') RETURNING id`, expID, string(raw)).Scan(new(int64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`UPDATE exploration_nodes
+SET state='superseded', payload=jsonb_set(payload,'{model,status}','"superseded"')
+WHERE id=$1`, v1b.NodeID); err != nil {
+		t.Fatal(err)
+	}
+	v3b := write("chain.example.com", "chain v3", map[string]any{"unknowns": []any{"legacy", "next"}})
+	m3b := readModel(v3b.NodeID)
+	if !reflect.DeepEqual(m3b["roles"], []any{"viewer"}) {
+		t.Fatalf("roles not resolved through compact chain: %#v", m3b["roles"])
+	}
+}
+
+// The graph projection drops superseded target-model revisions in SQL and only
+// returns edges whose endpoints survived; full history remains available via
+// Nodes/播报板.
+func TestNodesCurrentExcludesSupersededTargetModels(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	expID, err := d.CreateExploration("target-model-graph", "图投影")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	es := d.Exploration(expID)
+
+	var assetID int64
+	if err := d.QueryRow(`INSERT INTO assets(type, domain) VALUES ('root_domain','tmdl-graph.example') RETURNING id`).Scan(&assetID); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM assets WHERE id=$1`, assetID)
+
+	factID, err := es.AddNode(KindFact, map[string]any{"summary": "observed"}, 0, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	mk := func(summary string) *TargetModelWriteResult {
+		res, err := es.AddTargetModel(ctx, TargetModelInput{
+			Payload:     map[string]any{"summary": summary, "model": map[string]any{"group_key": "graph.example.com"}},
+			AssetIDs:    []int64{assetID},
+			EvidenceIDs: []int64{factID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	v1 := mk("v1")
+	v2 := mk("v2")
+
+	all, err := es.Nodes(2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allIDs := map[int64]bool{}
+	for _, n := range all {
+		allIDs[n.ID] = true
+	}
+	if !allIDs[v1.NodeID] || !allIDs[v2.NodeID] {
+		t.Fatal("full history must keep both versions")
+	}
+
+	current, err := es.NodesCurrent(2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]int64, 0, len(current))
+	cur := map[int64]bool{}
+	for _, n := range current {
+		ids = append(ids, n.ID)
+		cur[n.ID] = true
+	}
+	if cur[v1.NodeID] {
+		t.Fatal("superseded model leaked into current graph")
+	}
+	if !cur[v2.NodeID] || !cur[factID] {
+		t.Fatal("active model or fact missing from current graph")
+	}
+
+	edges, err := es.EdgesAmong(ids, 5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toActive := false
+	for _, e := range edges {
+		if e.From == v1.NodeID || e.To == v1.NodeID {
+			t.Fatalf("edge to superseded model returned: %+v", e)
+		}
+		if e.From == factID && e.To == v2.NodeID && e.Rel == RelDerivedFrom {
+			toActive = true
+		}
+	}
+	if !toActive {
+		t.Fatal("edge fact->active model missing")
+	}
+	lineage, err := es.EdgesForLineage(5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lineage) != 0 {
+		t.Fatalf("lineage returned target-model edges: %+v", lineage)
 	}
 }

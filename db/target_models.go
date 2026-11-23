@@ -80,15 +80,24 @@ WHERE exploration_id=$1 AND kind=$2
 	// the pointer is what makes that reference resolvable via node_detail.
 	var prevID int64
 	var prevVersion int
+	var prevPayloadRaw []byte
 	err = tx.QueryRowContext(ctx, `
-SELECT id, COALESCE((payload->'model'->>'version')::int, 0)
+SELECT id, COALESCE((payload->'model'->>'version')::int, 0), payload
 FROM exploration_nodes
 WHERE exploration_id=$1 AND kind=$2 AND state=$3
   AND payload->'model'->>'group_key'=$4
 ORDER BY (payload->'model'->>'version')::int DESC, id DESC
-LIMIT 1`, s.expID, KindTargetModel, StateTargetModelActive, groupKey).Scan(&prevID, &prevVersion)
+LIMIT 1`, s.expID, KindTargetModel, StateTargetModelActive, groupKey).Scan(&prevID, &prevVersion, &prevPayloadRaw)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
+	}
+	if prevPayloadRaw != nil {
+		var prevPayload map[string]any
+		if json.Unmarshal(prevPayloadRaw, &prevPayload) == nil {
+			if err := materializeTargetModelFields(ctx, tx, s.expID, model, prevPayload); err != nil {
+				return nil, err
+			}
+		}
 	}
 	delete(model, "supersedes")
 	delete(model, "supersedes_version")
@@ -191,6 +200,63 @@ WHERE id=$3 AND exploration_id=$4`,
 		return nil, err
 	}
 	return &TargetModelWriteResult{NodeID: nodeID, GroupKey: groupKey, Version: version, SupersededIDs: superseded}, nil
+}
+
+// targetModelStructuredFields are the model fields a compact revision may omit.
+var targetModelStructuredFields = []string{
+	"roles", "objects", "flows", "trust_boundaries",
+	"assumptions", "invariants", "unknowns",
+}
+
+// materializeTargetModelFields fills fields omitted by a compact revision from
+// the previous active revision. Earlier actives may themselves be compact, so it
+// follows their supersedes chain until every field is found or the chain ends.
+// Explicit JSON null counts as omitted; an explicit [] / {} is an intentional
+// clear and is preserved.
+func materializeTargetModelFields(ctx context.Context, tx *sql.Tx, expID int64, model map[string]any, prevPayload map[string]any) error {
+	missing := make(map[string]struct{}, len(targetModelStructuredFields))
+	for _, k := range targetModelStructuredFields {
+		if v, ok := model[k]; !ok || v == nil {
+			missing[k] = struct{}{}
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	payload := prevPayload
+	for depth := 0; depth < 128 && len(missing) > 0; depth++ {
+		pm, _ := payload["model"].(map[string]any)
+		if pm == nil {
+			return nil
+		}
+		for k := range missing {
+			if v, ok := pm[k]; ok && v != nil {
+				model[k] = v
+				delete(missing, k)
+			}
+		}
+		if len(missing) == 0 {
+			return nil
+		}
+		nextID, ok := jsonInt64(pm["supersedes"])
+		if !ok || nextID <= 0 {
+			return nil
+		}
+		var raw []byte
+		err := tx.QueryRowContext(ctx, `SELECT payload FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind=$3`, nextID, expID, KindTargetModel).Scan(&raw)
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var nextPayload map[string]any
+		if json.Unmarshal(raw, &nextPayload) != nil {
+			return nil
+		}
+		payload = nextPayload
+	}
+	return nil
 }
 
 // ListActiveTargetModels returns the newest active target model of each group,

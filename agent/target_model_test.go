@@ -120,8 +120,62 @@ func TestTargetModelFieldCountAcceptsObjects(t *testing.T) {
 	}
 }
 
-// Oversized matched models are compressed to an id/group/summary index; the
-// full payload is never injected into the system prompt.
+// Models sometimes emit group_key and the structured fields at the top level
+// instead of nesting them under model. Both shapes must reach the store; nested
+// values always win so an explicit model is never overwritten.
+func TestNormalizeTargetModelInputAcceptsFlatShape(t *testing.T) {
+	got := normalizeTargetModelInput(json.RawMessage(
+		`{"group_key":"g.flat","roles":["user"],"unknowns":{"q":"open"},"version":99}`), "", nil)
+	if got["group_key"] != "g.flat" {
+		t.Fatalf("flat group_key = %#v", got["group_key"])
+	}
+	if _, ok := got["roles"]; !ok {
+		t.Fatalf("flat roles not hoisted: %#v", got)
+	}
+	if _, ok := got["unknowns"]; !ok {
+		t.Fatalf("flat unknowns not hoisted: %#v", got)
+	}
+	if _, ok := got["version"]; ok {
+		t.Fatalf("server-owned version must not be hoisted: %#v", got)
+	}
+
+	nested := map[string]any{"group_key": "g.nested", "roles": []any{"admin"}}
+	got = normalizeTargetModelInput(json.RawMessage(`{"group_key":"g.top","roles":["user"]}`), "g.top", nested)
+	if got["group_key"] != "g.nested" {
+		t.Fatalf("nested group_key overwritten: %#v", got["group_key"])
+	}
+	if roles, _ := got["roles"].([]any); len(roles) != 1 || roles[0] != "admin" {
+		t.Fatalf("nested roles overwritten: %#v", got["roles"])
+	}
+
+	got = normalizeTargetModelInput(json.RawMessage(`{"group_key":"g.top2","roles":["user"]}`), "g.top2",
+		map[string]any{"flows": []any{"login"}})
+	if got["group_key"] != "g.top2" {
+		t.Fatalf("top-level group_key did not fill model: %#v", got)
+	}
+	if _, ok := got["flows"]; !ok {
+		t.Fatalf("existing model field dropped: %#v", got)
+	}
+
+	got = normalizeTargetModelInput(json.RawMessage(`{"group_key":"g.empty"}`), "",
+		map[string]any{"group_key": "  ", "roles": []any{"user"}})
+	if got["group_key"] != "g.empty" {
+		t.Fatalf("empty model group_key not replaced: %#v", got)
+	}
+
+	// A null field inside model is omitted, not an explicit clear: the flat
+	// top-level value must fill it.
+	got = normalizeTargetModelInput(json.RawMessage(`{"group_key":"g.nil","roles":["top"]}`), "",
+		map[string]any{"group_key": "g.nil", "roles": nil})
+	if roles, _ := got["roles"].([]any); len(roles) != 1 || roles[0] != "top" {
+		t.Fatalf("null model field not filled from top level: %#v", got["roles"])
+	}
+
+	if got = normalizeTargetModelInput(json.RawMessage(`{"summary":"x"}`), "", nil); len(got) != 0 {
+		t.Fatalf("shape without any group_key must stay empty: %#v", got)
+	}
+}
+
 func TestTargetModelContextSizeCeiling(t *testing.T) {
 	big := strings.Repeat("x", 9000)
 	items := []map[string]any{
@@ -186,6 +240,39 @@ func TestTargetModelToolGuardsWithStore(t *testing.T) {
 	res, err = plannerTS.writeTargetModel().Call(context.Background(), input, nil)
 	if err != nil || res.IsError {
 		t.Fatalf("planner path failed: err=%v res=%q", err, res.Flatten())
+	}
+
+	// Flat shape: group_key and structured fields at the top level, no model.
+	flat := json.RawMessage(`{"group_key":"g-flat","summary":"flat model","roles":["user"],"asset_ids":[` + fmt.Sprintf("%d", assetID) + `]}`)
+	res, err = plannerTS.writeTargetModel().Call(context.Background(), flat, nil)
+	if err != nil || res.IsError {
+		t.Fatalf("flat input failed: err=%v res=%q", err, res.Flatten())
+	}
+	// Half-flat shape: model present but group_key only at the top level.
+	halfFlat := json.RawMessage(`{"group_key":"g-flat2","summary":"half flat","model":{"flows":["login"]},"asset_ids":[` + fmt.Sprintf("%d", assetID) + `]}`)
+	res, err = plannerTS.writeTargetModel().Call(context.Background(), halfFlat, nil)
+	if err != nil || res.IsError {
+		t.Fatalf("half-flat input failed: err=%v res=%q", err, res.Flatten())
+	}
+	active, err := d.Exploration(task.ExplorationID).ListActiveTargetModels(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := map[string]bool{}
+	for _, n := range active {
+		var p struct {
+			Model map[string]any `json:"model"`
+		}
+		if json.Unmarshal(n.Payload, &p) == nil {
+			if gk, _ := p.Model["group_key"].(string); gk != "" {
+				groups[gk] = true
+			}
+		}
+	}
+	for _, want := range []string{"g", "g-flat", "g-flat2"} {
+		if !groups[want] {
+			t.Fatalf("group %q missing after flat writes: %v", want, groups)
+		}
 	}
 }
 

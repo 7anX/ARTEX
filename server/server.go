@@ -2456,6 +2456,18 @@ func inheritedGraphSnapshot(nodes []*db.Node, edges []db.Edge, sourceTaskID int6
 	return filteredNodes, filteredEdges
 }
 
+// nodeIDs returns the ids of the given nodes, skipping nils. The graph endpoint
+// uses it to select only edges whose both ends are part of the projected graph.
+func nodeIDs(nodes []*db.Node) []int64 {
+	out := make([]int64, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil {
+			out = append(out, n.ID)
+		}
+	}
+	return out
+}
+
 // taskIntentHistoryPage returns one newest-first page for an exploration.
 // A source may have many open/running intents, so keep paging until enough
 // historical results are collected instead of leaking its frontier into the UI.
@@ -2489,19 +2501,21 @@ func taskIntentHistoryPage(store *db.ExplorationStore, before int64, limit int, 
 	}
 }
 
-// explorationGraph returns the whole exploration chain (task graph) as nodes+edges.
+// explorationGraph returns the task's current exploration chain as nodes+edges.
+// Superseded target-model revisions are kept in storage for audit/supersedes
+// lookups but are not part of the current graph; the 播报板 still exposes them.
 func (s *Server) explorationGraph(w http.ResponseWriter, r *http.Request) {
 	t := s.m.ResolveTask(r.URL.Query().Get("task"))
 	if t == nil {
 		writeJSON(w, 200, map[string]any{"nodes": []any{}, "edges": []any{}})
 		return
 	}
-	nodes, err := t.Store.Nodes(2000)
+	nodes, err := t.Store.NodesCurrent(2000)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	edges, err := t.Store.Edges(5000)
+	edges, err := t.Store.EdgesAmong(nodeIDs(nodes), 5000)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -2512,12 +2526,12 @@ func (s *Server) explorationGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, source := range sources {
-		sourceNodes, nodeErr := source.Store.Nodes(2000)
+		sourceNodes, nodeErr := source.Store.NodesCurrent(2000)
 		if nodeErr != nil {
 			writeErr(w, 500, nodeErr.Error())
 			return
 		}
-		sourceEdges, edgeErr := source.Store.Edges(5000)
+		sourceEdges, edgeErr := source.Store.EdgesAmong(nodeIDs(sourceNodes), 5000)
 		if edgeErr != nil {
 			writeErr(w, 500, edgeErr.Error())
 			return

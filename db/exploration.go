@@ -840,6 +840,26 @@ func (s *ExplorationStore) Nodes(limit int) ([]*Node, error) {
 	return scanNodes(rows)
 }
 
+// NodesCurrent lists the nodes that make up the task's current graph.
+// Superseded target-model revisions are history, not current state (planner and
+// worker only read the active revision). Filtering in SQL matters: post-filtering
+// after Nodes() lets a long version history consume the row budget and push live
+// facts/intents out of the response.
+func (s *ExplorationStore) NodesCurrent(limit int) ([]*Node, error) {
+	if limit <= 0 {
+		limit = 2000
+	}
+	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
+WHERE exploration_id=$1
+  AND NOT (kind=$2 AND state=$3)
+ORDER BY id LIMIT $4`, s.expID, KindTargetModel, StateTargetModelSuperseded, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
 // NodeFilter narrows a NodesPage query. Empty fields include every value.
 type NodeFilter struct {
 	Kinds  []string // exploration_nodes.kind
@@ -984,6 +1004,64 @@ func (s *ExplorationStore) Edges(limit int) ([]Edge, error) {
 		limit = 5000
 	}
 	rows, err := s.db.Query(`SELECT src_id, rel, dst_id FROM exploration_edges WHERE exploration_id=$1 LIMIT $2`, s.expID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Edge
+	for rows.Next() {
+		var e Edge
+		if err := rows.Scan(&e.From, &e.Rel, &e.To); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// EdgesAmong returns edges whose both endpoints are in ids. The graph endpoint
+// calls it with the NodesCurrent result, so it never sends a dangling edge (an
+// edge to a node it did not include) and the edge limit is spent on visible
+// edges only.
+func (s *ExplorationStore) EdgesAmong(ids []int64, limit int) ([]Edge, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 5000
+	}
+	rows, err := s.db.Query(`SELECT src_id, rel, dst_id FROM exploration_edges
+WHERE exploration_id=$1 AND src_id = ANY($2) AND dst_id = ANY($2)
+LIMIT $3`, s.expID, ids, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Edge
+	for rows.Next() {
+		var e Edge
+		if err := rows.Scan(&e.From, &e.Rel, &e.To); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// EdgesForLineage lists only the edges graph_overview consumes: derived_from,
+// spawns and yields. Edges into target_model nodes are excluded because the
+// overview never reads them and a long model history would otherwise consume
+// the edge limit.
+func (s *ExplorationStore) EdgesForLineage(limit int) ([]Edge, error) {
+	if limit <= 0 {
+		limit = 5000
+	}
+	rows, err := s.db.Query(`SELECT e.src_id, e.rel, e.dst_id
+FROM exploration_edges e
+WHERE e.exploration_id=$1
+  AND e.rel IN ($2,$3,$4)
+  AND NOT EXISTS (SELECT 1 FROM exploration_nodes n WHERE n.id=e.dst_id AND n.kind=$5)
+LIMIT $6`, s.expID, RelDerivedFrom, RelSpawns, RelYields, KindTargetModel, limit)
 	if err != nil {
 		return nil, err
 	}

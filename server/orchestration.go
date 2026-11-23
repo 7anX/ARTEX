@@ -627,13 +627,14 @@ func (s *Server) reseedMainAgentPrompt() {
 // reseedPlannerPrompt 把 planner 提示词刷成【当前代码默认】——默认正文做了精简重构,并把「克制」降级为
 // 仅去重、新增「深度优先于覆盖度」「硬底线:目标未达成且无在跑意图必须产出」、给否定结论复核加上界，
 // v3 起加入「目标模型（target_models）」使用与修订引导；v4 起切换为操作员历史使用的完整提示词
-// （安全总则、漏洞价值/重复率判定、测试红线、内网横向边界）。
-// 每次默认有实质变更就 bump 下面的 flag(当前 v4)让存量旧库再刷一次。SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理
+// （安全总则、漏洞价值/重复率判定、测试红线、内网横向边界）；v5 起禁止把心跳/轮次/进度写成目标模型
+// 新版本，并要求 active 版本由服务端物化为完整快照。
+// 每次默认有实质变更就 bump 下面的 flag(当前 v5)让存量旧库再刷一次。SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理
 // 【追加一个新版本】并切过去(ResetPromptToDefault),旧版本仍保留在历史里,用户若自定义过可从版本记录
 // 找回。settings flag 守卫 → 成功后只做一次；失败不置位，下次启动重试。全新库无需处理(SeedPromptIfEmpty 已 seed 最新默认)。与
 // reseedGoalsPrompt 完全同构。
 func (s *Server) reseedPlannerPrompt() {
-	const flag = "planner_prompt_compact_realistic_v4"
+	const flag = "planner_prompt_compact_realistic_v5"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -655,7 +656,7 @@ func (s *Server) reseedPlannerPrompt() {
 		return // flag 不置位,下次启动重试
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
-	log.Printf("[prompts] planner 提示词已追加新默认版本(操作员完整提示词:安全总则/红线/目标模型引导,一次性)")
+	log.Printf("[prompts] planner 提示词已追加新默认版本(v5:目标模型只在材料性变化时版本化,active 物化为完整快照)")
 }
 
 // reseedWorkerPrompt 把 worker 提示词刷成【当前代码默认】——默认正文 record_fact 段删掉了「否定类结论

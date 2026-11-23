@@ -17,6 +17,9 @@ func TestBuiltinPromptsEmbedAndRender(t *testing.T) {
 	if !strings.Contains(planner, "任务即授权") || !strings.Contains(planner, "目标模型（target_models）") {
 		t.Fatalf("planner seed missing operator sections")
 	}
+	if !strings.Contains(planner, "只有目标模型发生材料性变化时才写新版本") || !strings.Contains(planner, "心跳") {
+		t.Fatalf("planner seed missing target-model write gating")
+	}
 	rendered := renderSystem("planner", planner, PlannerVars{Goal: "TARGET-X"})
 	if !strings.Contains(rendered, "TARGET-X") || strings.Contains(rendered, "{{") {
 		t.Fatalf("planner seed did not render cleanly")

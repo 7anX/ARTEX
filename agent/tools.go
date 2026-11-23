@@ -450,7 +450,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// derived_from — possibly several facts combined) and its yields (the
 	// facts/findings it produced). factFrom maps a fact → the intent that
 	// produced it. This is the relationship layer the flat lists lacked.
-	edges, _ := t.ts.Edges(5000)
+	edges, _ := t.ts.EdgesForLineage(5000)
 	parentsOf := map[int64][]int64{}
 	yieldsOf := map[int64][]int64{}
 	factFrom := map[int64]int64{}
@@ -755,7 +755,7 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		}
 		stats, statsErr := ts.Stats()
 
-		edges, _ := ts.Edges(5000)
+		edges, _ := ts.EdgesForLineage(5000)
 		parentsOf := map[int64][]int64{}
 		yieldsOf := map[int64][]int64{}
 		factFrom := map[int64]int64{}
@@ -2106,7 +2106,8 @@ func (t *ToolSet) writeTargetModel() actool.CoreTool {
 	return t.writeExpTool("write_target_model", "写入或修订【目标模型】（任务级业务/安全模型）。它只能作为后续意图的工作依据，不能直接作为漏洞证据；当前任务仍须用 observed fact/traffic 验证。只在 planner 中使用。", obj(map[string]any{
 		"summary":      str("目标模型一行摘要"),
 		"detail":       str("目标如何工作的结构化说明：角色、对象、流程、状态、信任边界、未知项"),
-		"model":        map[string]any{"type": "object", "description": "必须含 group_key；version/status/supersedes/supersedes_version 由系统填写；可含 roles/objects/flows/trust_boundaries/assumptions/invariants/unknowns（字符串数组或 {key: 说明} 对象）。修订时可省略未变化的结构化字段，detail 里写“与此前版本一致”；系统会把上一 active 版本记为 supersedes，读者可 node_detail 回查"},
+		"model":        map[string]any{"type": "object", "description": "必须含 group_key（也接受把 group_key/结构化字段放在顶层，服务端会归一化）；version/status/supersedes/supersedes_version 由系统填写；可含 roles/objects/flows/trust_boundaries/assumptions/invariants/unknowns（字符串数组或 {key: 说明} 对象）。修订时可省略未变化的结构化字段，detail 里写“与此前版本一致”；系统会把上一 active 版本记为 supersedes，读者可 node_detail 回查"},
+		"group_key":    str("兼容写法：目标模型分组键，等价于 model.group_key；传了 model 时以 model 内的值为准"),
 		"asset_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "目标模型覆盖的资产 id，至少一个"},
 		"evidence_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "支撑模型的本任务 fact/finding 节点 id"},
 	}),
@@ -2120,6 +2121,7 @@ func (t *ToolSet) writeTargetModel() actool.CoreTool {
 			var a struct {
 				Summary     string            `json:"summary"`
 				Detail      string            `json:"detail"`
+				GroupKey    string            `json:"group_key"`
 				Model       map[string]any    `json:"model"`
 				AssetIDs    []json.RawMessage `json:"asset_ids"`
 				EvidenceIDs []json.RawMessage `json:"evidence_ids"`
@@ -2127,6 +2129,7 @@ func (t *ToolSet) writeTargetModel() actool.CoreTool {
 			if err := json.Unmarshal(in, &a); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			a.Model = normalizeTargetModelInput(in, a.GroupKey, a.Model)
 			if strings.TrimSpace(a.Summary) == "" || len(a.Model) == 0 {
 				return actool.Errorf("summary 和 model 必填"), nil
 			}
@@ -2156,6 +2159,58 @@ func (t *ToolSet) writeTargetModel() actool.CoreTool {
 			}
 			return jsonResult(result)
 		})
+}
+
+// targetModelFlatFields are the structured model fields some callers emit at
+// the top level instead of inside model.
+var targetModelFlatFields = []string{
+	"roles", "objects", "flows", "trust_boundaries",
+	"assumptions", "invariants", "unknowns",
+}
+
+// normalizeTargetModelInput accepts both the canonical nested shape
+// {"model":{"group_key":"..."}} and the flat shape
+// {"group_key":"...","roles":[...]} that models often emit. Nested values win;
+// top-level fields only fill gaps, so an explicit model is never overwritten.
+func normalizeTargetModelInput(in json.RawMessage, groupKey string, model map[string]any) map[string]any {
+	if model == nil {
+		model = map[string]any{}
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(in, &raw); err != nil {
+		return model
+	}
+	for _, k := range targetModelFlatFields {
+		if v, ok := model[k]; ok && v != nil {
+			continue
+		}
+		v, ok := raw[k]
+		if !ok {
+			continue
+		}
+		var val any
+		if json.Unmarshal(v, &val) == nil {
+			model[k] = val
+		}
+	}
+	if v, ok := model["group_key"]; ok {
+		if s, isString := v.(string); !isString || strings.TrimSpace(s) != "" {
+			return model
+		}
+	}
+	gk := strings.TrimSpace(groupKey)
+	if gk == "" {
+		if v, ok := raw["group_key"]; ok {
+			var s string
+			if json.Unmarshal(v, &s) == nil {
+				gk = strings.TrimSpace(s)
+			}
+		}
+	}
+	if gk != "" {
+		model["group_key"] = gk
+	}
+	return model
 }
 
 // PlannerTools is the read + intent-generation + goal-judgement tool set.
